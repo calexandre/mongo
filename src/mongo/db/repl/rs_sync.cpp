@@ -34,6 +34,9 @@
 namespace mongo {
 
     using namespace bson;
+
+    MONGO_FP_DECLARE(rsChaining1);
+    MONGO_FP_DECLARE(rsChaining2);
    
     const int ReplSetImpl::maxSyncSourceLagSecs = 30;
 
@@ -251,42 +254,59 @@ namespace mongo {
         }
         verify(slave->slave);
 
-        const Member *target = BackgroundSync::get()->getSyncTarget();
-        if (!target || rs->box.getState().primary()
-            // we are currently syncing from someone who's syncing from us
-            // the target might end up with a new Member, but s.slave never
-            // changes so we'll compare the names
-            || target == slave->slave || target->fullName() == slave->slave->fullName()) {
-            LOG(1) << "replica set ghost target no good" << endl;
-            return;
-        }
+        while (true) {
+            const Member *target = BackgroundSync::get()->getSyncTarget();
+            if (!target || rs->box.getState().primary()
+                // we are currently syncing from someone who's syncing from us
+                // the target might end up with a new Member, but s.slave never
+                // changes so we'll compare the names
+                || target == slave->slave || target->fullName() == slave->slave->fullName()) {
+                LOG(1) << "replica set ghost target no good" << endl;
+                return;
+            }
 
-        if ( GTID::cmp(slave->lastGTID, lastGTID) > 0 ) {
-            return;
-        }
+            if ( GTID::cmp(slave->lastGTID, lastGTID) > 0 ) {
+                return;
+            }
 
-        try {
-            if (!slave->reader.haveConnection()) {
-                if (!slave->reader.connect(id, slave->slave->id(), target->fullName())) {
-                    // error message logged in OplogReader::connect
-                    return;
+            try {
+                if (MONGO_FAIL_POINT(rsChaining1)) {
+                    mongo::getGlobalFailPointRegistry()->getFailPoint("throwSockExcep")->
+                        setMode(FailPoint::nTimes, 1);
                 }
+
+                if (!slave->reader.haveConnection()) {
+                    if (!slave->reader.connect(id, slave->slave->id(), target->fullName())) {
+                        // error message logged in OplogReader::connect
+                        sleepsecs(1);
+                        continue;
+                    }
+                }
+
+                if (MONGO_FAIL_POINT(rsChaining2)) {
+                    mongo::getGlobalFailPointRegistry()->getFailPoint("throwSockExcep")->
+                        setMode(FailPoint::nTimes, 1);
+                }
+
+                bool ret = slave->reader.propogateSlaveLocation(lastGTID);
+                if (ret) {
+                    slave->lastGTID = lastGTID;
+                    LOG(2) << "now last is " << slave->lastGTID.toString() << rsLog;
+                }
+                else {
+                    LOG(0) << "failed to percolate to with new location" << lastGTID.toString() << rsLog;
+                    slave->reader.resetConnection();
+                    sleepsecs(1);
+                    continue;
+                }
+                return;
             }
-            bool ret = slave->reader.propogateSlaveLocation(lastGTID);
-            if (ret) {
-                slave->lastGTID = lastGTID;
-                LOG(2) << "now last is " << slave->lastGTID.toString() << rsLog;
-            }
-            else {
-                LOG(0) << "failed to percolate to with new location" << lastGTID.toString() << rsLog;
+            catch (const DBException& e) {
+                // This captures SocketExceptions as well.
+                LOG(0) << "replSet ghost sync error: " << e.what() << " for "
+                       << slave->slave->fullName() << rsLog;
                 slave->reader.resetConnection();
             }
-        }
-        catch (DBException& e) {
-            // we'll be back
-            LOG(2) << "replSet ghost sync error: " << e.what() << " for "
-                   << slave->slave->fullName() << rsLog;
-            slave->reader.resetConnection();
         }
     }
 }
